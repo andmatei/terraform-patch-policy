@@ -1,0 +1,35 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Configure the AWS-SystemsManager-AutomationAdministrationRole to allow multi-Region and multi-account automations for your organization."
+Resources:
+  MasterAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ssm.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              aws:SourceAccount: 
+                Fn::Sub: ${AWS::AccountId}
+            ArnLike:
+              aws:SourceArn: 
+                Fn::Sub: arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:automation-execution/*
+      Path: "/"
+      RoleName: AWS-SystemsManager-AutomationAdministrationRole-org
+      Policies:
+        - PolicyName: 'AssumeRole-AWSSystemsManagerAutomationExecutionRole-org'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action: sts:AssumeRole
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:iam::*:role/AWS-SystemsManager-AutomationExecutionRole-org
+            - Effect: Allow
+              Action: organizations:ListAccountsForParent
+              Resource: '*'

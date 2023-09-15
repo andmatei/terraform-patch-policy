@@ -1,0 +1,2190 @@
+#*
+#* Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#* SPDX-License-Identifier: MIT-0
+#*
+#* Permission is hereby granted, free of charge, to any person obtaining a copy of this
+#* software and associated documentation files (the "Software"), to deal in the Software
+#* without restriction, including without limitation the rights to use, copy, modify,
+#* merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+#* permit persons to whom the Software is furnished to do so.
+#*
+#* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+#* INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+#* PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+#* HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#* OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+#* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#*
+
+#------------------------------------------------------------------------------
+#
+# Template: com-workshop-resources.yaml
+# Purpose:  CloudFormation template to deploy test resources for the Getting Started with Centralized Operations Management workshop.
+#
+# Resources Created:
+# * Automation Administration IAM role
+# * Automation Execution IAM role
+# * Automation runbook for multi-account/Region patching
+# * VPC, subnet, route table, security group, and internet gateway for EC2 instances
+# * Resource Group for EC2 instances
+# * EC2 IAM instance role for Systems Manager
+# * Four Amazon Linux 2 instances
+# * Two Windows 2019 instances
+# * State Manager association to install and configure the Amazon CloudWatch agent using the basic configuration
+# * CloudWatch Alarms for CPU for each EC2 instance
+# * KMS CMK for Session Manager log encryption
+# * CloudWatch log group for Session Manager session logging
+# * Systems Manager Resource Data Sync
+# * S3 bucket for Resource Data Sync
+# * S3 bucket for command execution logs for Run Command and Patch Manager
+# * S3 bucket for AWS Config delivery channel
+# * AWS Config Configuration Recorder
+# * AWS Config Delivery Channel
+# * AWS Glue Crawler
+# * Amazon Athena queries
+# * Resource data sync
+#
+# Clean-up Steps:
+# 1. Delete the CloudFormation Stack
+#
+#------------------------------------------------------------------------------
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template to deploy test resources for the Getting Started with Centralized Operations Management workshop.
+
+#-----------------------------------------------------------
+# Parameters
+#-----------------------------------------------------------
+Parameters:
+  LatestAmazonLinux2AmiId:
+    # Use public Systems Manager Parameter
+    Type : AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  LatestWindowsAmiId:
+    # Use public Systems Manager Parameter
+    Type : AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base
+  MainRegion:
+    Type: String
+    Description: Main region for IAM.
+    Default: us-east-1
+  ResourceDataSyncPrefix:
+    Type: String
+    Description: Prefix to be used for the resource data sync.
+    Default: inventory
+
+Conditions:
+  IsMainRegion: !Equals [!Ref MainRegion, !Ref AWS::Region]
+
+Resources:
+
+  #-------------------------------------------------
+  # Automation Administration role for multi-account/Region Automation capabilities
+  #-------------------------------------------------
+  AutomationAdministrationRolePolicy:
+    Type: AWS::IAM::Policy
+    Condition: IsMainRegion
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - sts:AssumeRole
+          Resource:
+            !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AWS-SystemsManager-AutomationExecutionRole
+        - Effect: Allow
+          Action:
+          - organizations:ListAccountsForParent
+          Resource:
+          - "*"
+      PolicyName: AssumeRole-AWSSystemsManagerAutomationExecutionRole
+      Roles:
+        - !Ref AutomationAdministrationServiceRole
+
+  AutomationAdministrationServiceRole:
+    Type: AWS::IAM::Role
+    Condition: IsMainRegion
+    Properties:
+      RoleName: AWS-SystemsManager-AutomationAdministrationRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ssm.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+
+  #-------------------------------------------------
+  # Automation Execution role for multi-account/Region Automation capabilities
+  #-------------------------------------------------
+  AutomationExecutionServiceRolePolicy:
+    Type: AWS::IAM::Policy
+    Condition: IsMainRegion
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - iam:PassRole
+          Resource:
+          - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AWS-SystemsManager-AutomationExecutionRole
+        - Effect: Allow
+          Action:
+          - tag:GetResources
+          Resource: "*"
+        - Effect: Allow
+          Action:
+          - resource-groups:listGroupResources
+          Resource: "*"
+      PolicyName: AssumeRole-AWSSystemsManagerAutomationExecutionRole
+      Roles:
+        - !Ref AutomationExecutionServiceRole
+
+  AutomationExecutionServiceRole:
+    Type: AWS::IAM::Role
+    Condition: IsMainRegion
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ssm.amazonaws.com
+            AWS:
+            - !GetAtt AutomationAdministrationServiceRole.Arn
+            - !Ref AWS::AccountId
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Path: "/"
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+      RoleName: AWS-SystemsManager-AutomationExecutionRole
+
+  #-------------------------------------------------
+  # Automation document to run AWS-RunPatchBaseline on target resources
+  #-------------------------------------------------
+  AutomationDocumentRunPatchBaseline:
+    Condition: IsMainRegion
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+      Content:
+        description: >-
+          This document runs the Command document ```AWS-RunPatchBaseline``` on the specified instances.
+        schemaVersion: '0.3'
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          AutomationAssumeRole:
+            type: 'AWS::IAM::Role::Arn'
+            description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.
+            default: !GetAtt AutomationAdministrationServiceRole.Arn
+          InstallOverrideList:
+            type: String
+            default: ""
+            description: >-
+              (Optional) An https URL or an Amazon S3 path-style URL to the list of patches to be installed. This patch installation list overrides the patches specified by the default patch baseline.
+          Operation:
+            type: String
+            default: Scan
+            allowedValues:
+            - Install
+            - Scan
+            description: >-
+              (Required) The update or configuration to perform on the instance. The
+              system checks if patches specified in the patch baseline are installed on
+              the instance. The install operation installs patches missing from the
+              baseline.
+          RebootOption:
+            type: String
+            default: RebootIfNeeded
+            allowedValues:
+            - RebootIfNeeded
+            - NoReboot
+            description: >-
+              (Optional) Reboot behavior after a patch Install operation. If you choose
+              NoReboot and patches are installed, the instance is marked as non-compliant
+              until a subsequent reboot and scan.
+          ResourceGroupName:
+            description: The name of the Resource Group to target.
+            type: String
+            default: !Ref ManagedInstancesResourceGroup
+          SnapshotId:
+            type: String
+            default: ""
+            description: >-
+              (Optional) The snapshot ID to use to retrieve a patch baseline snapshot.
+        mainSteps:
+          - name: runPatchBaseline
+            action: 'aws:runCommand'
+            timeoutSeconds: 7200
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunPatchBaseline
+              Targets:
+              - Key: 'resource-groups:Name'
+                Values:
+                  - '{{ ResourceGroupName }}'
+              Parameters:
+                Operation: '{{ Operation }}'
+                RebootOption: '{{ RebootOption }}'
+                SnapshotId: '{{ SnapshotId }}'
+                InstallOverrideList: '{{ InstallOverrideList }}'
+              OutputS3BucketName: !Ref CommandLogsBucket
+              OutputS3KeyPrefix: 'patching/accountid={{global:ACCOUNT_ID}}/region={{global:REGION}}/executionid={{automation:EXECUTION_ID}}'
+            description: >-
+              This command runs the Command document ```AWS-RunPatchBaseline``` on the specified instances.
+
+  #-------------------------------------------------
+  # Bucket used to store instance command logs
+  #-------------------------------------------------
+  CommandLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ssm-command-logs-${AWS::Region}-${AWS::AccountId}
+      AccessControl: BucketOwnerFullControl
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+
+  #-------------------------------------------------
+  # Custom patch baselines for Windows, Amazon Linux, and Amazon Linux 2
+  #-------------------------------------------------
+
+  WindowsPatchBaseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      Name: !Join [ '-', ['CustomWindowsPatchBaseline', !Ref 'AWS::AccountId'] ]
+      Description: Baseline containing all SecurityUpdates and CriticalUpdates approved for Windows instances
+      OperatingSystem: WINDOWS
+      ApprovalRules:
+        PatchRules:
+        - PatchFilterGroup:
+            PatchFilters:
+            - Values:
+              - '*'
+              Key: MSRC_SEVERITY
+            - Values:
+              - SecurityUpdates
+              - CriticalUpdates
+              Key: CLASSIFICATION
+            - Values:
+              - '*'
+              Key: PRODUCT
+          ApproveAfterDays: 0
+          ComplianceLevel: CRITICAL
+
+  AmazonLinux2PatchBaseline:
+    Type: AWS::SSM::PatchBaseline
+    Properties:
+      Name: !Join [ '-', ['CustomAmazonLinux2PatchBaseline', !Ref 'AWS::AccountId'] ]
+      Description: Baseline containing all Security and Bugfix updates approved for Amazon Linux 2 instances
+      OperatingSystem: AMAZON_LINUX_2
+      ApprovedPatchesEnableNonSecurity: true
+      ApprovalRules:
+        PatchRules:
+        - PatchFilterGroup:
+            PatchFilters:
+            - Values:
+              - '*'
+              Key: SEVERITY
+            - Values:
+              - Security
+              Key: CLASSIFICATION
+            - Values:
+              - '*'
+              Key: PRODUCT
+          ApproveAfterDays: 0
+          ComplianceLevel: CRITICAL
+        - PatchFilterGroup:
+            PatchFilters:
+            - Values:
+              - '*'
+              Key: SEVERITY
+            - Values:
+              - Bugfix
+              Key: CLASSIFICATION
+            - Values:
+              - '*'
+              Key: PRODUCT
+          ApproveAfterDays: 0
+          ComplianceLevel: MEDIUM
+
+  #-------------------------------------------------
+  # Key used to encrypt instance data
+  #-------------------------------------------------
+  ManagedInstanceDataEncryptionKey:
+    Type: AWS::KMS::Key
+    DependsOn:
+      - AWSQuickSightS3Policy
+      - QuickSightServiceRole
+    Properties:
+      Description: Key used to encrypt instance data
+      Enabled: True
+      EnableKeyRotation: True
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: AccountPolicy
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: '*'
+        - Sid: Allow use of the key by Systems Manager and Quick Sight
+          Effect: Allow
+          Principal:
+            Service: ssm.amazonaws.com
+            AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/service-role/aws-quicksight-service-role-v0
+          Action:
+            - kms:DescribeKey
+            - kms:Encrypt
+            - kms:Decrypt
+            - kms:ReEncrypt*
+            - kms:GenerateDataKey
+            - kms:GenerateDataKeyWithoutPlaintext
+          Resource: '*'
+
+  ManagedInstanceDataEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/SSM-ManagedInstanceDataEncryptionKey
+      TargetKeyId: !Ref ManagedInstanceDataEncryptionKey
+
+  #-------------------------------------------------
+  # Resource Data Sync to aggregate inventory, patching, and compliance data in the central S3 bucket
+  #-------------------------------------------------
+  ResourceDataSync:
+    Type: AWS::SSM::ResourceDataSync
+    DependsOn: ResourceSyncBucketPolicy
+    Properties:
+      SyncName: inventory-ssm-workshop
+      S3Destination:
+        BucketName: !Ref ResourceSyncBucket
+        BucketPrefix: !Ref ResourceDataSyncPrefix
+        BucketRegion: !Ref AWS::Region
+        SyncFormat: JsonSerDe
+        KMSKeyArn: !GetAtt ManagedInstanceDataEncryptionKey.Arn
+
+  #-------------------------------------------------
+  # Bucket used to store instance data
+  #-------------------------------------------------
+  ResourceSyncBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'ssm-resource-sync-${AWS::Region}-${AWS::AccountId}'
+      AccessControl: BucketOwnerFullControl
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref ManagedInstanceDataEncryptionKey
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  #-------------------------------------------------
+  # Bucket policy to add to S3 bucket to store instance data
+  #-------------------------------------------------
+  ResourceSyncBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResourceSyncBucket
+      PolicyDocument:
+        Statement:
+        - Sid: SSMBucketPermissionsCheck
+          Effect: Allow
+          Principal:
+            Service: ssm.amazonaws.com
+          Action: s3:GetBucketAcl
+          Resource: !GetAtt ResourceSyncBucket.Arn
+        - Sid: SSMBucketDelivery
+          Effect: Allow
+          Principal:
+            Service: ssm.amazonaws.com
+          Action: s3:PutObject
+          Resource: !Sub arn:${AWS::Partition}:s3:::${ResourceSyncBucket}/*
+          Condition:
+            StringEquals:
+              s3:x-amz-server-side-encryption: aws:kms
+              s3:x-amz-server-side-encryption-aws-kms-key-id: !GetAtt ManagedInstanceDataEncryptionKey.Arn
+              # s3:x-amz-acl: bucket-owner-full-control
+              # s3:RequestObjectTag/OrgId: !Ref OrganizationId
+        - Sid: SSMWrite
+          Effect: Allow
+          Principal: "*"
+          Action: s3:PutObject
+          Resource: !Sub arn:${AWS::Partition}:s3:::${ResourceSyncBucket}/*
+          Condition:
+            StringEquals:
+              s3:x-amz-acl: bucket-owner-full-control
+              aws:SourceAccount: !Sub ${AWS::AccountId}
+            ArnLike:
+              aws:SourceArn: !Sub arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:resource-data-sync/*
+        - Sid: SSMBucketDeliveryTagging
+          Effect: Allow
+          Principal:
+            Service: ssm.amazonaws.com
+          Action: s3:PutObjectTagging
+          Resource: !Sub arn:${AWS::Partition}:s3:::${ResourceSyncBucket}/*/accountid=*/*
+
+  #-----------------------------------------------------------
+  # Configure Glue database, role, and crawler
+  #-----------------------------------------------------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: ssm_global_resource_sync
+        Description: Systems Manager Global Resource Data Sync Database
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      DatabaseName: !Ref GlueDatabase
+      Description: Crawler for AWS Systems Manager Resource Data Sync
+      Name: SSM-GlueCrawler
+      Role: !GetAtt GlueCrawlerRole.Arn
+      SchemaChangePolicy:
+        DeleteBehavior: DELETE_FROM_DATABASE
+        UpdateBehavior: UPDATE_IN_DATABASE
+      Schedule:
+        ScheduleExpression: 'cron(0 0 * * ? *)'
+      Targets:
+        S3Targets:
+          - Path: !Ref ResourceSyncBucket
+            Exclusions:
+              - !Sub ${ResourceDataSyncPrefix}/AWS:InstanceInformation/accountid=*/test.json
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SSM-GlueCrawlerRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - glue.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+      - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole
+      Path: "/service-role/"
+      Description: Role created for Glue to access resource data sync S3 bucket
+      Policies:
+        - PolicyName: S3Actions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub ${ResourceSyncBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt ManagedInstanceDataEncryptionKey.Arn
+
+  #-------------------------------------------------
+  # The AWS:InstanceInformation table includes a column named
+  # 'resourcetype', which is also a partition key, which causes
+  # Athena queries to fail. The following resources include an
+  # IAM role, a Lambda function, and CloudWatch Event rule, and
+  # a Lambda permission. The CloudWatch Event rule is triggered
+  # by the Glue crawler execution, which then invokes the Lambda
+  # function to delete the column.
+  #-------------------------------------------------
+  DeleteGlueTableColumnFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SSM-DeleteGlueTableColumnFunctionRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueActions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/aws_instanceinformation
+
+  DeleteGlueTableColumnFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SSM-DeleteGlueTableColumnFunction
+      Description:
+        Deletes the 'resourcetype' Glue table that causes an issue when loading partitions in Athena
+      Runtime: python3.7
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 600
+      Role: !GetAtt DeleteGlueTableColumnFunctionRole.Arn
+      Environment:
+        Variables:
+          CRAWLER_NAME: !Ref GlueCrawler
+          DATABASE_NAME: !Ref GlueDatabase
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          CRAWLER_NAME = os.environ['CRAWLER_NAME']
+          DATABASE_NAME = os.environ['DATABASE_NAME']
+          TABLE_NAME = 'aws_instanceinformation'
+          COLUMN_NAME = 'resourcetype'
+
+          glue_client = boto3.client('glue')
+
+          def lambda_handler(event, context):
+
+              print(json.dumps(event, default=str))
+
+              # Get the crawler name from the event.
+              event_crawler_name = event['detail']['crawlerName']
+
+              if event_crawler_name == CRAWLER_NAME:
+                  # This is the crawler we're looking for, so get a reference to the right
+                  # table and delete the column.
+
+                  response = glue_client.get_table(
+                      CatalogId=context.invoked_function_arn.split(":")[4],
+                      DatabaseName=DATABASE_NAME,
+                      Name=TABLE_NAME
+                  )
+
+                  # Update the column name if the table exists.
+                  if response['Table']:
+
+                      table = response['Table']
+
+                      # We have a reference to the table, so get the columns.
+                      columns = table['StorageDescriptor']['Columns']
+
+                      # Remove the unwanted column.
+                      updated_columns = [i for i in columns if not (i['Name'] == COLUMN_NAME)]
+
+                      # Updat the columns for the table object.
+                      table['StorageDescriptor']['Columns'] = updated_columns
+
+                      # Remove unnecessary fields.
+                      table.pop('DatabaseName', None)
+                      table.pop('CreatedBy', None)
+                      table.pop('CreateTime', None)
+                      table.pop('UpdateTime', None)
+                      table.pop('IsRegisteredWithLakeFormation', None)
+                      table.pop('CatalogId', None)
+                      table.pop('VersionId', None)
+
+                      # Update the table with the removed 'resourcetype' column.
+                      response = glue_client.update_table(
+                          CatalogId=context.invoked_function_arn.split(":")[4],
+                          DatabaseName=DATABASE_NAME,
+                          TableInput=table
+                      )
+
+  DeleteGlueTableColumnFunctionEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SSM-DeleteGlueTableColumn
+      Description: Deletes resourcetype from Glue table
+      EventPattern:
+        source:
+          - aws.glue
+        detail-type:
+          - Glue Crawler State Change
+        detail:
+          state:
+            - Succeeded
+      Targets:
+        - Arn: !GetAtt DeleteGlueTableColumnFunction.Arn
+          Id: "TargetFunctionV1"
+
+  DeleteGlueTableColumnFunctionCloudWatchPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DeleteGlueTableColumnFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DeleteGlueTableColumnFunctionEventRule.Arn
+
+  #-------------------------------------------------
+  # Bucket used to store Athena query details
+  #-------------------------------------------------
+  AthenaQueryResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ssm-res-sync-athena-query-results-${AWS::Region}-${AWS::AccountId}
+      AccessControl: BucketOwnerFullControl
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref ManagedInstanceDataEncryptionKey
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  #-----------------------------------------------------------
+  # Create Athena workgroup and named queries.
+  #-----------------------------------------------------------
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: com-workgroup
+      RecursiveDeleteOption: true
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${AthenaQueryResultsBucket}
+  AthenaQueryCompliantPatch:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Join [ '-', [!Ref ResourceSyncBucket, 'database'] ]
+      Description: Example query to list managed instances that are compliant for patching.
+      Name: QueryCompliantPatch
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT DISTINCT aws_complianceitem.accountid,
+          aws_complianceitem.region,
+          aws_complianceitem.resourceid,
+          aws_complianceitem.status,
+          aws_complianceitem.id,
+          aws_complianceitem.title,
+          aws_complianceitem.classification,
+          aws_complianceitem.patchseverity,
+          aws_complianceitem.severity,
+          aws_complianceitem.executiontype,
+          aws_complianceitem.patchbaselineid,
+          aws_complianceitem.capturetime
+        FROM aws_complianceitem,
+          aws_tag
+        WHERE aws_complianceitem.compliancetype = 'Patch'
+          AND aws_complianceitem.status = 'COMPLIANT'
+          AND aws_tag.key = 'Workload'
+          AND aws_tag.value = 'com-workshop'
+        LIMIT 20
+  AthenaQueryNonCompliantPatch:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Join [ '-', [!Ref ResourceSyncBucket, 'database'] ]
+      Description: Example query to list managed instances that are non-compliant for patching.
+      Name: QueryNonCompliantPatch
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT DISTINCT aws_complianceitem.accountid,
+          aws_complianceitem.region,
+          aws_complianceitem.resourceid,
+          aws_complianceitem.status,
+          aws_complianceitem.id,
+          aws_complianceitem.title,
+          aws_complianceitem.classification,
+          aws_complianceitem.patchseverity,
+          aws_complianceitem.severity,
+          aws_complianceitem.executiontype,
+          aws_complianceitem.patchbaselineid,
+          aws_complianceitem.capturetime
+        FROM aws_complianceitem,
+          aws_tag
+        WHERE aws_complianceitem.compliancetype = 'Patch'
+          AND aws_complianceitem.status = 'NON_COMPLIANT'
+          AND aws_tag.key = 'Workload'
+          AND aws_tag.value = 'com-workshop'
+        LIMIT 20
+  AthenaQueryPatchSummary:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Join [ '-', [!Ref ResourceSyncBucket, 'database'] ]
+      Description: Example query to provide a patch summary for managed nodes.
+      Name: QueryPatchSummary
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT DISTINCT aws_patchsummary.accountid,
+          aws_patchsummary.region,
+          aws_patchsummary.resourceid,
+          aws_patchsummary.missingcount,
+          aws_patchsummary.criticalnoncompliantcount,
+          aws_patchsummary.othernoncompliantcount,
+          aws_patchsummary.installedpendingrebootcount,
+          aws_patchsummary.installedcount,
+          aws_patchsummary.failedcount,
+          aws_patchsummary.installedrejectedcount,
+          aws_patchsummary.operationtype,
+          aws_patchsummary.rebootoption,
+          aws_patchsummary.baselineid,
+          aws_patchsummary.capturetime
+        FROM aws_patchsummary,
+          aws_tag
+        WHERE aws_tag.key = 'Workload'
+          AND aws_tag.value = 'com-workshop'
+        LIMIT 20
+  AthenaQueryComplianceSummaryPatch:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Join [ '-', [!Ref ResourceSyncBucket, 'database'] ]
+      Description: Example query to provide a compliance summary for patch for managed nodes.
+      Name: QueryComplianceSummaryPatch
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT DISTINCT aws_compliancesummary.accountid,
+          aws_compliancesummary.region,
+          aws_compliancesummary.resourceid,
+          aws_compliancesummary.status,
+          aws_compliancesummary.executiontype,
+          aws_compliancesummary.overallseverity,
+          aws_compliancesummary.compliantcriticalcount,
+          aws_compliancesummary.patchbaselineid,
+          aws_compliancesummary.capturetime
+        FROM aws_compliancesummary,
+          aws_tag
+        WHERE aws_compliancesummary.compliancetype = 'Patch'
+          AND aws_compliancesummary.status = 'COMPLIANT'
+          AND aws_tag.key = 'Workload'
+          AND aws_tag.value = 'com-workshop'
+        LIMIT 20
+  AthenaQuerySSMAgent:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Join [ '-', [!Ref ResourceSyncBucket, 'database'] ]
+      Description: Example query to list SSM Agent versions installed on managed instances.
+      Name: QuerySSMAgentVersion
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT DISTINCT aws_application.accountid,
+          aws_application.region,
+          aws_application.resourceid,
+          aws_application.name,
+          aws_application.version,
+          aws_application.installedtime,
+          aws_application.applicationtype,
+          aws_application.summary,
+          aws_application.architecture,
+          aws_application.packageid,
+          aws_application.publisher,
+          aws_application.capturetime
+        FROM aws_application,
+          aws_tag
+        WHERE aws_tag.key = 'Workload'
+          AND aws_tag.value = 'com-workshop'
+          AND aws_application.name = 'Amazon SSM Agent'
+          OR aws_application.name = 'amazon-ssm-agent'
+  AthenaQueryInstanceList:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Join [ '-', [!Ref ResourceSyncBucket, 'database'] ]
+      Description: Example query to return a list of non-terminated instances.
+      Name: QueryInstanceList
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT DISTINCT aws_instanceinformation.accountid,
+          aws_instanceinformation.region,
+          aws_instanceinformation.resourceid,
+          aws_instanceinformation.computername,
+          aws_instanceinformation.ipaddress,
+          aws_instanceinformation.instancestatus,
+          aws_instanceinformation.platformtype,
+          aws_instanceinformation.platformname,
+          aws_instanceinformation.platformversion,
+          aws_instanceinformation.agenttype,
+          aws_instanceinformation.agentversion,
+          aws_instanceinformation.capturetime
+        FROM aws_instanceinformation,
+          aws_tag
+        WHERE aws_tag.key = 'Workload'
+          AND aws_tag.value = 'com-workshop'
+  AthenaQueryInstanceApplications:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Join [ '-', [!Ref ResourceSyncBucket, 'database'] ]
+      Description: Example query to return a list of non-terminated instances and their applications installed.
+      Name: QueryInstanceApplications
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        SELECT DISTINCT aws_application.accountid,
+          aws_application.region,
+          aws_application.resourceid,
+          aws_application.name,
+          aws_application.version,
+          aws_application.installedtime,
+          aws_application.applicationtype,
+          aws_application.summary,
+          aws_application.architecture,
+          aws_application.packageid,
+          aws_application.publisher,
+          aws_application.capturetime
+        FROM aws_application,
+          aws_tag
+        WHERE aws_tag.key = 'Workload'
+          AND aws_tag.value = 'com-workshop'
+
+  #-------------------------------------------------
+  # Resource Group to target for multi-account/multi-Region Automation
+  #-------------------------------------------------
+  ManagedInstancesResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Description: This is a test Resource Group for the COM workshop
+      Name: ManagedInstances
+      ResourceQuery:
+        Type: TAG_FILTERS_1_0
+        Query:
+          ResourceTypeFilters:
+           - "AWS::AllSupported"
+          TagFilters:
+            -
+              Key: Workload
+              Values:
+                - com-workshop
+
+  #-------------------------------------------------
+  # IAM role and instance profile to enable Systems Manager registration on EC2 instances
+  #-------------------------------------------------
+  ManagedInstanceRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:PutObjectAcl
+            Resource:
+              - !GetAtt CommandLogsBucket.Arn
+              - !Sub ${CommandLogsBucket.Arn}/*
+              - arn:aws:s3:::aws-quicksetup-patchpolicy-*
+          - Effect: Allow
+            Action:
+            - kms:Decrypt
+            Resource: !Sub arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key:*
+          - Effect: Allow
+            Action:
+            - logs:DescribeLogGroups
+            - logs:DescribeLogStreams
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:CreateLogGroup
+            - logs:PutLogEvents
+            Resource:
+            - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:session-manager-${AWS::Region}:log-stream:*
+            - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:session-manager-${AWS::Region}
+
+        Version: 2012-10-17
+      PolicyName: !Sub Managed-Instance-Policy-${AWS::Region}
+      Roles:
+        - !Ref ManagedInstanceRole
+
+  ManagedInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      - !Sub arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy
+      Path: "/"
+      RoleName: !Sub AmazonSSMManagedInstanceCore-${AWS::Region}
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+
+  ManagedInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - !Ref ManagedInstanceRole
+      InstanceProfileName: !Sub ManagedInstanceProfile-${AWS::Region}
+
+  #-------------------------------------------------
+  # Key used to encrypt CloudWatch and Session Manager related data
+  #-------------------------------------------------
+  SessionManagerDataEncryptionKey:
+    DependsOn: ManagedInstanceRole
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Key used to encrypt Session Manager related data
+      Enabled: True
+      EnableKeyRotation: True
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: AccountPolicy
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: '*'
+        - Sid: Allow use of the key by the instance
+          Effect: Allow
+          Principal:
+            AWS:
+            - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AmazonSSMManagedInstanceCore-${AWS::Region}
+          Action:
+            - kms:DescribeKey
+            - kms:Encrypt
+            - kms:Decrypt
+            - kms:ReEncrypt*
+            - kms:GenerateDataKey
+            - kms:GenerateDataKeyWithoutPlaintext
+          Resource: '*'
+        - Sid: Allow use of the key by CloudWatch Logs
+          Effect: Allow
+          Principal:
+            Service: !Sub logs.${AWS::Region}.amazonaws.com
+          Action:
+          - kms:Encrypt*
+          - kms:Decrypt*
+          - kms:ReEncrypt*
+          - kms:GenerateDataKey*
+          - kms:Describe*
+          Resource: "*"
+
+  SessionManagerDataEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/fleet-manager
+      TargetKeyId: !Ref SessionManagerDataEncryptionKey
+
+  SessionManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      KmsKeyId: !GetAtt SessionManagerDataEncryptionKey.Arn
+      LogGroupName: !Sub session-manager-${AWS::Region}
+      RetentionInDays: 30
+
+  #-------------------------------------------------
+  # VPC and required resources to enable network connectivity to AWS Systems Manager
+  #-------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  SubnetPublic:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.0.0/20
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+  RouteTablePublic:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+  RouteTableAssociationPublic:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetPublic
+      RouteTableId: !Ref RouteTablePublic
+  RouteTablePublicInternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  NetworkAclPublic:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+  SubnetNetworkAclAssociationPublic:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref SubnetPublic
+      NetworkAclId: !Ref NetworkAclPublic
+  NetworkAclEntryInPublicAllowAll:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref NetworkAclPublic
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+  NetworkAclEntryOutPublicAllowAll:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref NetworkAclPublic
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 0.0.0.0/0
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for SSM Workshop test instances
+      GroupName: COM-Workshop-CF
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+      VpcId: !Ref VPC
+  WebInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web Security Group for SSM Workshop test instances
+      GroupName: COM-Workshop-CF-Web
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+      VpcId: !Ref VPC
+
+  #-------------------------------------------------
+  # Four Amazon Linux 2 EC2 instances using the latest AMI for Amazon Linux 2
+  #-------------------------------------------------
+  LinuxEc2InstanceOne:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      ImageId: !Ref LatestAmazonLinux2AmiId
+      Monitoring: true
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: InstanceSecurityGroup
+          SubnetId:
+            Ref: SubnetPublic
+      # Removing IAM instance profile to show Quick Setup
+      #IamInstanceProfile: !Ref ManagedInstanceProfile
+      Tags:
+        - Key: Name
+          Value: App1
+        - Key: Patch
+          Value: 'true'
+        - Key: Workload
+          Value: com-workshop
+        - Key: Function
+          Value: AppServer
+  LinuxEc2InstanceTwo:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      ImageId: !Ref LatestAmazonLinux2AmiId
+      Monitoring: true
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: InstanceSecurityGroup
+          SubnetId:
+            Ref: SubnetPublic
+      # Removing IAM instance profile to show Quick Setup
+      #IamInstanceProfile: !Ref ManagedInstanceProfile
+      Tags:
+        - Key: Name
+          Value: App2
+        - Key: Patch
+          Value: 'true'
+        - Key: Workload
+          Value: com-workshop
+        - Key: Function
+          Value: AppServer
+  LinuxEc2InstanceThree:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      ImageId: !Ref LatestAmazonLinux2AmiId
+      Monitoring: true
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: WebInstanceSecurityGroup
+          SubnetId:
+            Ref: SubnetPublic
+      IamInstanceProfile: !Ref ManagedInstanceProfile
+      Tags:
+        - Key: Name
+          Value: Web1
+        - Key: Patch
+          Value: 'true'
+        - Key: Workload
+          Value: com-workshop
+        - Key: Function
+          Value: WebServer
+  LinuxEc2InstanceFour:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      ImageId: !Ref LatestAmazonLinux2AmiId
+      Monitoring: true
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: WebInstanceSecurityGroup
+          SubnetId:
+            Ref: SubnetPublic
+      IamInstanceProfile: !Ref ManagedInstanceProfile
+      Tags:
+        - Key: Name
+          Value: Web2
+        - Key: Patch
+          Value: 'true'
+        - Key: Workload
+          Value: com-workshop
+        - Key: Function
+          Value: WebServer
+
+  #-------------------------------------------------
+  # Two Windows 2019 EC2 instances using the latest AMI for Windows 2019
+  #-------------------------------------------------
+  WindowsEc2InstanceOne:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.medium
+      ImageId: !Ref LatestWindowsAmiId
+      Monitoring: true
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: InstanceSecurityGroup
+          SubnetId:
+            Ref: SubnetPublic
+      IamInstanceProfile: !Ref ManagedInstanceProfile
+      Tags:
+        - Key: Name
+          Value: WindowsWeb1
+        - Key: Patch
+          Value: 'true'
+        - Key: Workload
+          Value: com-workshop
+        - Key: Function
+          Value: WindowsWebServer
+  WindowsEc2InstanceTwo:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.medium
+      ImageId: !Ref LatestWindowsAmiId
+      Monitoring: true
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: InstanceSecurityGroup
+          SubnetId:
+            Ref: SubnetPublic
+      IamInstanceProfile: !Ref ManagedInstanceProfile
+      Tags:
+        - Key: Name
+          Value: WindowsWeb2
+        - Key: Patch
+          Value: 'true'
+        - Key: Workload
+          Value: com-workshop
+        - Key: Function
+          Value: WindowsWebServer
+
+  #-------------------------------------------------
+  # CloudWatch Alarms for CPU usage for each EC2 instance
+  #-------------------------------------------------
+  CPUCloudWatchAlarmLinuxEc2InstanceOne:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Monitor for CPU usage on SampleApp instance.
+      AlarmName: !Sub App1-${LinuxEc2InstanceOne}-CPU-Spike
+      ActionsEnabled: true
+      AlarmActions:
+      - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:opsitem:3#CATEGORY=Performance
+      ComparisonOperator: GreaterThanThreshold
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      Threshold: 60
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref LinuxEc2InstanceOne
+
+  CPUCloudWatchAlarmLinuxEc2InstanceTwo:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Monitor for CPU usage on SampleApp instance.
+      AlarmName: !Sub App2-${LinuxEc2InstanceTwo}-CPU-Spike
+      ActionsEnabled: true
+      AlarmActions:
+      - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:opsitem:3#CATEGORY=Performance
+      ComparisonOperator: GreaterThanThreshold
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      Threshold: 60
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref LinuxEc2InstanceTwo
+
+  CPUCloudWatchAlarmLinuxEc2InstanceThree:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Monitor for CPU usage on SampleApp instance.
+      AlarmName: !Sub Web1-${LinuxEc2InstanceThree}-CPU-Spike
+      ActionsEnabled: true
+      AlarmActions:
+      - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:opsitem:3#CATEGORY=Performance
+      - !Sub arn:${AWS::Partition}:ssm-incidents::${AWS::AccountId}:response-plan/webapp-performance-issues-response-plan
+      ComparisonOperator: GreaterThanThreshold
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      Threshold: 60
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref LinuxEc2InstanceThree
+
+  CPUCloudWatchAlarmLinuxEc2InstanceFour:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Monitor for CPU usage on SampleApp instance.
+      AlarmName: !Sub Web2-${LinuxEc2InstanceFour}-CPU-Spike
+      ActionsEnabled: true
+      AlarmActions:
+      - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:opsitem:3#CATEGORY=Performance
+      ComparisonOperator: GreaterThanThreshold
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      Threshold: 60
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref LinuxEc2InstanceFour
+
+  CPUCloudWatchAlarmWindowsEc2InstanceOne:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Monitor for CPU usage on SampleApp instance.
+      AlarmName: !Sub WindowsWeb1-${WindowsEc2InstanceOne}-CPU-Spike
+      ActionsEnabled: true
+      AlarmActions:
+      - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:opsitem:3#CATEGORY=Performance
+      ComparisonOperator: GreaterThanThreshold
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      Threshold: 60
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WindowsEc2InstanceOne
+
+  CPUCloudWatchAlarmWindowsEc2InstanceTwo:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Monitor for CPU usage on SampleApp instance.
+      AlarmName: !Sub WindowsWeb2-${WindowsEc2InstanceTwo}-CPU-Spike
+      ActionsEnabled: true
+      AlarmActions:
+      - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:opsitem:3#CATEGORY=Performance
+      ComparisonOperator: GreaterThanThreshold
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      Threshold: 60
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref WindowsEc2InstanceTwo
+
+  #-------------------------------------------------
+  # Composite document and State Manager association to install and configure the Amazon CloudWatch agent
+  #-------------------------------------------------
+  InstallAndConfigureCloudWatchAgent:
+    Type: AWS::SSM::Document
+    Properties:
+      Content:
+        schemaVersion: '2.2'
+        description: The InstallAndManageCloudWatch command document installs the Amazon CloudWatch agent and manages the configuration of the agent for Amazon EC2 instances.
+        mainSteps:
+        - inputs:
+            documentParameters:
+              name: AmazonCloudWatchAgent
+              action: Install
+            documentType: SSMDocument
+            documentPath: AWS-ConfigureAWSPackage
+          name: installCWAgent
+          action: aws:runDocument
+        - inputs:
+            documentParameters:
+              mode: ec2
+              optionalRestart: 'yes'
+              optionalConfigurationSource: default
+              action: configure
+            documentType: SSMDocument
+            documentPath: AmazonCloudWatch-ManageAgent
+          name: manageCWAgent
+          action: aws:runDocument
+      DocumentFormat: YAML
+      DocumentType: Command
+      TargetType: /AWS::EC2::Instance
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+
+  CloudWatchAgentAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: InstallCloudWatchAgent
+      Name: !Ref InstallAndConfigureCloudWatchAgent
+      ScheduleExpression: rate(7 days)
+      Targets:
+      - Key: InstanceIds
+        Values:
+        - "*"
+      WaitForSuccessTimeoutSeconds: 300
+
+  #-------------------------------------------------
+  # Setup AWS Config
+  #-------------------------------------------------
+  ConfigServiceLinkedRole:
+    Type: AWS::IAM::ServiceLinkedRole
+    Properties:
+      AWSServiceName: config.amazonaws.com
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+      RoleARN: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn: ConfigDeliveryChannelBucketPolicy
+    Properties:
+      S3BucketName: !Ref ConfigDeliveryChannelBucket
+
+  ConfigDeliveryChannelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'config-bucket-${AWS::Region}-${AWS::AccountId}'
+      AccessControl: BucketOwnerFullControl
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+
+  ConfigDeliveryChannelBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigDeliveryChannelBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AWSConfigBucketPermissionsCheck
+          Effect: Allow
+          Principal:
+            Service: config.amazonaws.com
+          Action: s3:GetBucketAcl
+          Resource: !Sub arn:${AWS::Partition}:s3:::${ConfigDeliveryChannelBucket}
+        - Sid: AWSConfigBucketExistenceCheck
+          Effect: Allow
+          Principal:
+            Service: config.amazonaws.com
+          Action: s3:ListBucket
+          Resource: !Sub arn:${AWS::Partition}:s3:::${ConfigDeliveryChannelBucket}
+        - Sid: AWSConfigBucketDelivery
+          Effect: Allow
+          Principal:
+            Service: config.amazonaws.com
+          Action: s3:PutObject
+          Resource: !Sub arn:${AWS::Partition}:s3:::${ConfigDeliveryChannelBucket}/AWSLogs/${AWS::AccountId}/Config/*
+          Condition:
+            StringEquals:
+              s3:x-amz-acl: bucket-owner-full-control
+
+  ConfigRuleEC2ManagedBySSM:
+    Type: AWS::Config::ConfigRule
+    DependsOn: [ConfigServiceLinkedRole, ConfigRecorder, ConfigDeliveryChannel]
+    Properties:
+      Description: Checks whether the Amazon EC2 instances in your account are managed by AWS Systems Manager.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+          - AWS::SSM::ManagedInstanceInventory
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_INSTANCE_MANAGED_BY_SSM
+
+  #-------------------------------------------------
+  # Config auto remediation IAM role
+  #-------------------------------------------------
+  ConfigAutoRemediation:
+    Type: AWS::IAM::Role
+    Condition: IsMainRegion
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ssm.amazonaws.com
+          Action: sts:AssumeRole
+      Path: "/"
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+
+  ConfigAutoRemediationPolicy:
+    Type: 'AWS::IAM::Policy'
+    Condition: IsMainRegion
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+            - ec2:RevokeSecurityGroupIngress
+            - ssm:StartChangeRequestExecution
+            - ec2:StopInstances
+            - ec2:DescribeInstanceStatus
+            Resource: "*"
+          - Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt ConfigAutoRemediation.Arn
+          - Effect: Allow
+            Action: iam:CreateServiceLinkedRole
+            Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/changemanagement.ssm.amazonaws.com/AWSServiceRoleForSystemsManagerChangeManagement"
+      PolicyName: ConfigAutoRemediationPolicy
+      Roles:
+        - !Ref ConfigAutoRemediation
+
+  #-------------------------------------------------
+  # Automation document to create a Change Manager request
+  #-------------------------------------------------
+  AutomationDocumentCreateChangeRequest:
+    Condition: IsMainRegion
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+      Content:
+        description: |-
+          *This Automation runbook will create a AWS Change Manager request.*
+        schemaVersion: '0.3'
+        assumeRole: "{{ AutomationAssumeRole }}"
+        parameters:
+          InstanceId:
+            type: AWS::EC2::Instance::Id
+            description: (Required) The ID of the EC2 instance on which you want to stop.
+          AutomationAssumeRole:
+            type: AWS::IAM::Role::Arn
+            default: !GetAtt ConfigAutoRemediation.Arn
+            description: (Optional) The Amazon Resource Name (ARN) of the role that allows Systems Manager Automation to perform the actions on your behalf.
+        mainSteps:
+          - name: StopInstancesChange
+            description: Creates a change request to stop an instance
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: script_handler
+              InputPayload:
+                InstanceId: '{{InstanceId}}'
+                AutomationAssumeRole: '{{AutomationAssumeRole}}'
+              Script: |-
+                import json
+
+                def script_handler(event, context):
+                    import boto3
+                    ssm_client = boto3.client('ssm')
+                    instanceId = event["InstanceId"]
+                    roleArn = event['AutomationAssumeRole']
+
+                    response = ssm_client.start_change_request_execution(
+                        DocumentName='remediate-banned-application',
+                        Runbooks=[
+                            {
+                                'DocumentName': 'AWS-StopEC2Instance',
+                                'Parameters': {
+                                    'InstanceId': [instanceId],
+                                    'AutomationAssumeRole': [roleArn]
+                                }
+                            }
+                        ]
+                    )
+  #-------------------------------------------------
+  # SNS Topic for Change Manager request notifications
+  #-------------------------------------------------
+  ChangeManagerSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: workshop-notifications
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+
+  #-------------------------------------------------
+  # IAM role and policy for Incident Manager
+  #-------------------------------------------------
+  IncidentManagerRolePolicy:
+    Type: AWS::IAM::Policy
+    Condition: IsMainRegion
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - sts:AssumeRole
+          Resource:
+            !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AWS-SystemsManager-AutomationExecutionRole
+        - Effect: Allow
+          Action:
+          - ssm:StartAutomationExecution
+          Resource:
+            !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/WebApp-response-runbook:*
+        - Effect: Allow
+          Action:
+          - ssm-incidents:*
+          Resource: !Sub arn:${AWS::Partition}:ssm-incidents:*:*:*
+        - Effect: Allow
+          Action:
+          - ssm-contacts:*
+          Resource: !Sub arn:${AWS::Partition}:ssm-contacts:*:*:*
+      PolicyName: StartIncidents
+      Roles:
+        - !Ref IncidentManagerRole
+
+  IncidentManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ssm-incidents.amazonaws.com
+          Action: sts:AssumeRole
+      Path: "/"
+      RoleName: IncidentManager-role
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+
+  #-------------------------------------------------
+  # IAM role, Lambda function, and custom resource to clean up S3 buckets
+  #-------------------------------------------------
+  S3CleanupLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+      Policies:
+        - PolicyName: LogAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:*:*:*
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${AthenaQueryResultsBucket}
+                  - !Sub arn:${AWS::Partition}:s3:::${CommandLogsBucket}
+                  - !Sub arn:${AWS::Partition}:s3:::${ConfigDeliveryChannelBucket}
+                  - !Sub arn:${AWS::Partition}:s3:::${ResourceSyncBucket}
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${AthenaQueryResultsBucket}/*
+                  - !Sub arn:${AWS::Partition}:s3:::${CommandLogsBucket}/*
+                  - !Sub arn:${AWS::Partition}:s3:::${ConfigDeliveryChannelBucket}/*
+                  - !Sub arn:${AWS::Partition}:s3:::${ResourceSyncBucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:DeleteBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${ConfigDeliveryChannelBucket}
+
+  S3BucketCleanup:
+    Type: AWS::Lambda::Function
+    Properties:
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+      Code:
+        ZipFile: |
+          #*
+          #* Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          #* SPDX-License-Identifier: MIT-0
+          #*
+          #* Permission is hereby granted, free of charge, to any person obtaining a copy of this
+          #* software and associated documentation files (the "Software"), to deal in the Software
+          #* without restriction, including without limitation the rights to use, copy, modify,
+          #* merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+          #* permit persons to whom the Software is furnished to do so.
+          #*
+          #* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+          #* INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+          #* PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+          #* HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+          #* OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+          #* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+          #*
+
+          import cfnresponse
+          import boto3
+
+          def lambda_handler(event, context):
+            print(event)
+
+            # Globals
+            responseData = {}
+            ResponseStatus = cfnresponse.SUCCESS
+            s3BucketNamesEvent = event['ResourceProperties']['s3BucketNames']
+
+            s3BucketNames = s3BucketNamesEvent.split(",")
+
+            if event['RequestType'] == 'Create':
+              responseData['Message'] = "Resource creation successful!"
+            elif event['RequestType'] == 'Update':
+              responseData['Message'] = "Resource update successful!"
+            elif event['RequestType'] == 'Delete':
+              # Need to empty the S3 bucket before it is deleted
+              s3 = boto3.resource('s3')
+              s3Client = boto3.client('s3')
+
+              for s3BucketName in s3BucketNames:
+                print(s3BucketName)
+                if 'config-bucket' in s3BucketName:
+                    bucket = s3.Bucket(s3BucketName)
+                    bucketVersioning = s3.BucketVersioning(s3BucketName)
+                    if bucketVersioning.status == 'Enabled':
+                        response = bucket.object_versions.delete()
+                        print(response)
+                        bucket.objects.delete()
+                    else:
+                        bucket.objects.delete()
+                    s3Client.delete_bucket(Bucket=s3BucketName)
+                else:
+                    bucket = s3.Bucket(s3BucketName)
+                    bucketVersioning = s3.BucketVersioning(s3BucketName)
+                    if bucketVersioning.status == 'Enabled':
+                        response = bucket.object_versions.delete()
+                        print(response)
+                        bucket.objects.delete()
+                    else:
+                        bucket.objects.delete()
+              responseData['Message'] = "Resource deletion successful!"
+
+            cfnresponse.send(event, context, ResponseStatus, responseData)
+      Description: This function is called when CloudFormation stack is created/updated/deleted and does cleanup the S3 bucket when the CF stack is deleted.
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt S3CleanupLambdaExecutionRole.Arn
+      Runtime: python3.8
+      Timeout: 300
+
+  CRS3Cleanup:
+    Type: Custom::S3BucketCleanupFunction
+    Properties:
+      ServiceToken: !GetAtt S3BucketCleanup.Arn
+      s3BucketNames: !Sub "${AthenaQueryResultsBucket},${CommandLogsBucket},${ConfigDeliveryChannelBucket},${ResourceSyncBucket}"
+
+#-------------------------------------------------
+# IAM Policy and roles for Quick sight setup
+#-------------------------------------------------
+  AWSQuickSightS3Policy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:ListAllMyBuckets
+            Resource:
+              - "arn:aws:s3:::*"
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::ssm-resource-sync-${AWS::Region}-${AWS::AccountId}
+              - !Sub arn:${AWS::Partition}:s3:::ssm-res-sync-athena-query-results-${AWS::Region}-${AWS::AccountId}
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::ssm-resource-sync-${AWS::Region}-${AWS::AccountId}/*
+              - !Sub arn:${AWS::Partition}:s3:::ssm-res-sync-athena-query-results-${AWS::Region}-${AWS::AccountId}/*
+          - Effect: Allow
+            Action:
+              - s3:ListBucketMultipartUploads
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::ssm-resource-sync-${AWS::Region}-${AWS::AccountId}
+              - !Sub arn:${AWS::Partition}:s3:::ssm-res-sync-athena-query-results-${AWS::Region}-${AWS::AccountId}
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::ssm-resource-sync-${AWS::Region}-${AWS::AccountId}/*
+              - !Sub arn:${AWS::Partition}:s3:::ssm-res-sync-athena-query-results-${AWS::Region}-${AWS::AccountId}/*
+      ManagedPolicyName: AWSQuickSightS3Policy
+
+  QuickSightServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: aws-quicksight-service-role-v0
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - quicksight.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref AWSQuickSightS3Policy
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSQuicksightAthenaAccess
+      Path: "/service-role/"
+      Description: Role created for QuickSight Service
+
+#-------------------------------------------------
+# Lambda function to get old Amazon provided AMI 
+#-------------------------------------------------
+  GetOldAMILambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: "/"
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+      Policies:
+      - PolicyName: LambdaFunctionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - ec2:Describe*
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - ssm:Describe*
+              - ssm:PutParameter
+              - ssm:DeleteParameter
+              - ssm:DeleteParameters
+              - ssm:GetParameter
+              - ssm:GetParameters
+            Resource: '*'
+  GetOldAMILambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: getOldWindowsAMI
+      Role: !GetAtt GetOldAMILambdaFunctionRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Timeout: 15
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+      Code:
+        ZipFile: |
+      
+          import boto3
+          import os
+          import cfnresponse
+          from operator import attrgetter
+
+          def lambda_handler(event, context):
+            
+            response_data = {}
+            physical_resource_id = event['PhysicalResourceId'] if 'PhysicalResourceId' in event else None
+            request_type = event['RequestType']
+            
+            if request_type == 'Delete':
+              response_data['Message'] = 'SSM Parameter will be deleted by CFN'
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id)
+              return
+
+            if request_type == 'Create' or request_type == 'Update':
+              try:
+                # Define the region and AMI Name
+                aws_region = os.environ['AWS_REGION']
+                ami_name = "Windows_Server-2019-English-Full-Base*"
+    
+                # Create a Boto3 resource for EC2 service and filter based on AMI name
+                ec2_resource = boto3.resource('ec2', region_name = aws_region)
+                response = ec2_resource.images.filter(
+                  Filters=[
+                    {
+                      'Name': 'name',
+                      'Values': [ami_name]
+                    },
+                    {
+                      'Name': 'owner-alias',
+                      'Values': ['amazon']
+                    }
+                  ]
+                )
+                #Sort the list based on Creation date and get the first ami id from the list
+                image_list = sorted(list(response),key=attrgetter('creation_date'))
+                first_ami_id = image_list[0].id
+                response_data['AmiId'] = first_ami_id
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id)
+                return
+              except Exception:
+                cfnresponse.send(event, context, cfnresponse.FAILED, response_data, physical_resource_id)
+                return
+
+  GetOldAMILambdaInvoke:
+    Type: AWS::CloudFormation::CustomResource
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt GetOldAMILambdaFunction.Arn
+
+  OldWindowsAmiIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties: 
+      DataType: aws:ec2:image
+      Description: 'Old Windows 2019 AMI ID for com workshop compliance graph'
+      Name: '/com-workshop/windows-2019-old-ami'
+      Type: String
+      Value: !GetAtt GetOldAMILambdaInvoke.AmiId
+
+  #--------------------------------------------------------------------------
+  # Windows EC2 Intances launched from old Amazon AMI for noncompliance graph
+  #--------------------------------------------------------------------------
+  WindowsEc2InstanceNonCompOne:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !GetAtt OldWindowsAmiIdParameter.Value
+      Monitoring: true
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: InstanceSecurityGroup
+          SubnetId:
+            Ref: SubnetPublic
+      IamInstanceProfile: !Ref ManagedInstanceProfile
+      Tags:
+        - Key: Name
+          Value: WindowsNonComp1
+        - Key: Workload
+          Value: com-workshop
+  WindowsEc2InstanceNonCompTwo:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !GetAtt OldWindowsAmiIdParameter.Value
+      Monitoring: true
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: InstanceSecurityGroup
+          SubnetId:
+            Ref: SubnetPublic
+      IamInstanceProfile: !Ref ManagedInstanceProfile
+      Tags:
+        - Key: Name
+          Value: WindowsNonComp2
+        - Key: Workload
+          Value: com-workshop
+
+#-------------------------------------------------
+# Lambda function to get old AWS provided Amazon Linux 2 AMI 
+#-------------------------------------------------
+
+  GetOldAL2AMILambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: getOldAL2AMI
+      Role: !GetAtt GetOldAMILambdaFunctionRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Timeout: 15
+      Tags:
+        - Key: Workload
+          Value: com-workshop
+      Code:
+        ZipFile: |
+      
+          import boto3
+          import os
+          import cfnresponse
+          from operator import attrgetter
+
+          def lambda_handler(event, context):
+            
+            response_data = {}
+            physical_resource_id = event['PhysicalResourceId'] if 'PhysicalResourceId' in event else None
+            request_type = event['RequestType']
+            
+            if request_type == 'Delete':
+              response_data['Message'] = 'SSM Parameter will be deleted by CFN'
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id)
+              return
+
+            if request_type == 'Create' or request_type == 'Update':
+              try:
+                # Define the region and AMI Name
+                aws_region = aws_region = os.environ['AWS_REGION']
+                ami_name = "amzn2-ami-kernel-5.10-hvm*-x86_64-gp2"
+    
+                # Create a Boto3 resource for EC2 service and filter based on AMI name
+                ec2_resource = boto3.resource('ec2', region_name = aws_region)
+                response = ec2_resource.images.filter(
+                  Filters=[
+                    {
+                      'Name': 'name',
+                      'Values': [ami_name]
+                    },
+                    {
+                      'Name': 'owner-alias',
+                      'Values': ['amazon']
+                    }
+                  ]
+                )
+                #Sort the list based on Creation date and get the first ami id from the list
+                image_list = sorted(list(response),key=attrgetter('creation_date'))
+                first_ami_id = image_list[0].id
+                response_data['AmiId'] = first_ami_id
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id)
+                return
+              except Exception:
+                cfnresponse.send(event, context, cfnresponse.FAILED, response_data, physical_resource_id)
+                return
+
+  GetOldAL2AMILambdaInvoke:
+    Type: AWS::CloudFormation::CustomResource
+    Version: "1.0"
+    Properties:
+      ServiceToken: !GetAtt GetOldAL2AMILambdaFunction.Arn
+
+  OldAL2AmiIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties: 
+      DataType: aws:ec2:image
+      Description: Old Amazon Linux 2 AMI ID for COM workshop
+      Name: /com-workshop/al2-old-ami
+      Type: String
+      Value: !GetAtt GetOldAL2AMILambdaInvoke.AmiId
+
+# Create EC2 Linux
+  OldAL2LinuxInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !GetAtt OldAL2AmiIdParameter.Value
+      InstanceType: t2.medium
+      IamInstanceProfile: !Ref ManagedInstanceProfile
+      Tags:
+        - Key: Name
+          Value: AL2NonComp
+        - Key: Workload
+          Value: com-workshop
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: InstanceSecurityGroup
+          SubnetId:
+            Ref: SubnetPublic
+
+  OldAL2LinuxInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !GetAtt OldAL2AmiIdParameter.Value
+      InstanceType: t2.medium
+      IamInstanceProfile: !Ref ManagedInstanceProfile
+      Tags:
+        - Key: Name
+          Value: AL2NonComp2
+        - Key: Workload
+          Value: com-workshop
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: InstanceSecurityGroup
+          SubnetId:
+            Ref: SubnetPublic
+
+Outputs:
+  CommandLogsBucketName:
+    Description: The name of the S3 bucket used to store command logs centrally.
+    Value: !Ref CommandLogsBucket
+  ConfigAutoRemediation:
+    Condition: IsMainRegion
+    Description: The ARN of the Config Auto Remediation IAM role.
+    Value: !GetAtt ConfigAutoRemediation.Arn
+  ConfigDeliveryChannelBucket:
+    Description: The name of the S3 bucket used for the AWS Config delivery channel.
+    Value: !Ref ConfigDeliveryChannelBucket
+  KMSKeyArn:
+    Description: The ARN of the custom KMS key.
+    Value: !GetAtt SessionManagerDataEncryptionKey.Arn
+  ResourceSyncBucketName:
+    Description: The name of the S3 bucket used to store resource data sync details.
+    Value: !Ref ResourceSyncBucket
